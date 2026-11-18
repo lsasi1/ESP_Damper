@@ -13,7 +13,7 @@
 // DOIT ESP32 DEVKIT V1 pin map. Avoids SPI-flash pins (6-11),
 // boot-strapping pins (0, 2, 5, 12, 15), and input-only pins (34-39).
 static const gpio_num_t CHANNEL_GPIOS[NUM_CHANNELS] = {
-    GPIO_NUM_13, GPIO_NUM_14, GPIO_NUM_17, GPIO_NUM_18,
+    GPIO_NUM_13, GPIO_NUM_2, GPIO_NUM_15, GPIO_NUM_18,
     GPIO_NUM_19, GPIO_NUM_21, GPIO_NUM_22, GPIO_NUM_23
 };
 

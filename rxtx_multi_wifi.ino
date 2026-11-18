@@ -26,6 +26,7 @@ mqtt_data_t mqtt_data[NUM_CHANNELS];
 
 void setup() {
     Serial.begin(115200);
+    Serial.println("\n--- SETUP STARTED ---");
     delay(500);
     
     led_task_start();
