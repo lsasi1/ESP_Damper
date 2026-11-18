@@ -40,8 +40,6 @@ void wireless_setup() {
     if(wifi_sta_mode) {
         led_set_blink(100);
         client.setServer(device_config.mqtt_server, device_config.mqtt_port);
-        // 3072 leaves headroom for the largest HA discovery payload (~1.8 KB)
-        // plus topic and MQTT framing overhead.
         client.setBufferSize(3072);
         client.setCallback(mqtt_callback);
     }
@@ -120,9 +118,8 @@ static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     if (ch >= NUM_CHANNELS) return;
   }
 
-  // Preserve last-known temp/fan from mqtt_data when the incoming command
-  // omits them (HA's "off" command template only sends {ch,state}). Prevents
-  // us from echoing temp=0 back and letting HA overwrite its own setpoint.
+  mqtt_data[ch].retries = 0;
+
   if (jsonDoc.containsKey("temp")) {
     temp = jsonDoc["temp"].as<uint8_t>();
   } else {
@@ -133,8 +130,6 @@ static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     state = jsonDoc["state"].as<String>();
   }
   if (jsonDoc.containsKey("fan")) {
-    // Fan is a string label ("low"/"medium"/"high"/"auto") — convert to
-    // the wire-format damper angle 0..3 that send_tx_payload expects.
     fan = fan_label_to_damper_angle(jsonDoc["fan"].as<String>());
   } else {
     fan = mqtt_data[ch].fan;
@@ -152,7 +147,6 @@ static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   }
 
   if (!tx_requests[ch].pending) {
-      // Just store request
       tx_requests[ch].pending = true;
       tx_requests[ch].ch = ch;
       tx_requests[ch].temp = temp;
@@ -212,7 +206,6 @@ void public_raw_message(StaticJsonDocument<2048> doc) {
 void start_ap_mode() {
     Serial.println("No WiFi SSID configured, entering AP mode");
     WiFi.mode(WIFI_AP);
-    // Set static IP for AP mode
     if (!WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET)) {
         Serial.println("Failed to configure AP IP");
     }
@@ -223,7 +216,7 @@ void start_ap_mode() {
     Serial.print("AP IP: ");
     Serial.println(WiFi.softAPIP());
 
-    led_set_blink(1000);   // Slow blink in AP mode
+    led_set_blink(1000);
 }
 
 void start_sta_mode() {
@@ -254,7 +247,6 @@ static String device_unique_base() {
 static void publish_discovery() {
   const String base = device_unique_base();
 
-  // Disable path: erase entities by publishing empty retained payloads.
   if (!device_config.enable_discovery) {
     for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
       String t = String("homeassistant/climate/") + base + "_ch" + ch + "/config";
@@ -286,10 +278,6 @@ static void publish_discovery() {
     dev["model"]        = "TAC-910 / VAT-6 IR bridge";
     dev["sw_version"]   = FW_VERSION_STR;
 
-    // HVAC modes depend on the AC controller:
-    //   TAC-910: the wall remote is on/off only — cool vs heat is set at
-    //            the AC's central unit. Expose "off" and "auto" (= on).
-    //   VAT-6  : cool/heat is encoded per-frame — expose both explicitly.
     JsonArray modes = doc.createNestedArray("modes");
     modes.add("off");
     if (is_vat6) {
@@ -314,7 +302,6 @@ static void publish_discovery() {
 
     const String ch_filter = String("{% if value_json.ch == ") + ch + " %}";
 
-    // Inbound (device -> HA) state templates.
     doc["current_temperature_topic"]    = tx_topic;
     doc["current_temperature_template"] =
         ch_filter + "{{ value_json.temp }}{% endif %}";
@@ -325,14 +312,12 @@ static void publish_discovery() {
 
     doc["mode_state_topic"] = tx_topic;
     if (is_vat6) {
-      // VAT-6: mode is real; map cool/heat directly, off from state.
       doc["mode_state_template"] =
           ch_filter +
           "{% if value_json.state == 'off' %}off"
           "{% elif value_json.mode in ['cool','heat'] %}{{ value_json.mode }}"
           "{% endif %}{% endif %}";
     } else {
-      // TAC-910: no cool/heat on the wire — just on/off.
       doc["mode_state_template"] =
           ch_filter +
           "{% if value_json.state == 'off' %}off{% else %}auto{% endif %}"
@@ -343,10 +328,6 @@ static void publish_discovery() {
     doc["fan_mode_state_template"] =
         ch_filter + "{{ value_json.fan }}{% endif %}";
 
-    // Outbound (HA -> device) command templates. `this.state` is the
-    // current HVAC mode, `this.attributes.*` are the setpoint and fan.
-    // We use `or <default>` (rather than `| int(N)`) so that a stale 0
-    // value in HA's state — from any prior bug — still falls back sanely.
     doc["temperature_command_topic"] = rx_topic;
     if (is_vat6) {
       doc["temperature_command_template"] =
@@ -378,7 +359,6 @@ static void publish_discovery() {
           ",\"fan\":\"{{ this.attributes.fan_mode or 'Auto' }}\"}"
           "{% endif %}";
     } else {
-      // TAC-910: value is 'off' or 'auto'; no mode field on the wire.
       doc["mode_command_template"] =
           String("{% if value == 'off' %}") +
           "{\"ch\":" + ch + ",\"state\":\"off\""

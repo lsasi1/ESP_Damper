@@ -1,15 +1,3 @@
-// Latest ElegantOTA requires manual configuration to work in AsyncWebServer mode.
-//
-// 1. In ElegantOTA.h, set:
-//        #define ELEGANTOTA_USE_ASYNC_WEBSERVER 1
-//
-// 2. In ElegantOTA.cpp, uncomment the `/update` GUI route inside the
-//    `#if ELEGANTOTA_USE_ASYNC_WEBSERVER == 1` block (remove the `/* ... */`
-//    wrapping `_server->on("/update", HTTP_GET, ...)`). Without this, the
-//    /ota/start and /ota/upload endpoints work but the browser-friendly
-//    upload page at http://<device>/update returns 404.
-
-
 #include "wireless.h"
 #include "rx.h"
 #include "tx.h"
@@ -18,11 +6,17 @@
 #include "reset.h"
 #include "serial_intercept.h"
 
-#define VERSION "1.1.18"
+#define VERSION "1.1.19"
 
 const char* FW_VERSION_STR = VERSION;
 bool single_shot = true;
 mqtt_data_t mqtt_data[NUM_CHANNELS];
+
+// Prototypes for functions defined below setup()
+void on_rx_frame(uint8_t ch, const rmt_symbol_word_t* symbols, size_t num_symbols, const String& bits);
+
+// מערך לשמירת זמן הניסיון האחרון לצורך השהייה (Delay) בין Retries
+static unsigned long last_retry_time[NUM_CHANNELS] = {0};
 
 void setup() {
     Serial.begin(115200);
@@ -50,15 +44,11 @@ void setup() {
     wireless_setup();
 
     Serial.println("Starting RMT RX/TX multi channel...");
-    // gpio_install_isr_service() must be called before gpio_isr_handler_add,
-    // which happens inside ack_gpio_init(). Moved before the loop for that
-    // reason (previously it ran after the loop, which was fine only because
-    // ack_gpio_init was dynamic — now that it's permanent, order matters).
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
     for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
         rmt_rx_channel_config(ch, CHANNEL_GPIOS[ch]);
         ack_irq_init(ch);
-        ack_gpio_init(ch);   // Permanent ISR install — see rx.cpp:ack_gpio_isr
+        ack_gpio_init(ch);
         rx_last_call[ch] = micros();
     }
     
@@ -66,12 +56,18 @@ void setup() {
     Serial.println(NUM_CHANNELS - 1);
 
     rx_set_callback(on_rx_frame); // Debug data callback
-
+    
+    // שידור סטטוס ראשוני לכל הערוצים מיד עם סיום העלייה (Boot)
+    for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
+        public_message(mqtt_data[ch]);
+    }
     led_set_on();
 }
 
 void loop() {
     wireless_loop();
+
+    states_handle_deferred_save();
 
     // Handle RX -> MQTT transaction
     uint32_t parse_start_us = micros();
@@ -83,11 +79,6 @@ void loop() {
                 rx_new_data[ch] = false;
                 if (device_config.rx_ack_en) {
                     ack_irq_start(ch);
-                    // The ISR was installed once at setup and is always
-                    // running; no per-op ack_gpio_init call needed. If the
-                    // ACK already fired while parseRMTData was running,
-                    // ack_irq_start() catches it retrospectively and sets
-                    // ack_active immediately (no timer started).
                     if (device_config.debug_verbose && device_config.timing_diagnostics_en) {
                         uint32_t frame_to_start = ack_dbg_start_time[ch] - ack_dbg_frame_end_time[ch];
                         const char* how = ack_active[ch] ? "retrospective" : "prospective";
@@ -113,6 +104,8 @@ void loop() {
     // Handle MQTT -> TX transaction
     for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
         if (tx_requests[ch].pending && !mqtt_data[ch].pending) {
+            mqtt_data[ch].retries = 0;
+
             uint32_t tx_start_us = micros();
             send_tx_payload(ch, CHANNEL_GPIOS[ch], tx_requests[ch].temp, tx_requests[ch].state == "on", tx_requests[ch].fan, tx_requests[ch].mode);
             uint32_t tx_end_us = micros();
@@ -144,22 +137,17 @@ void loop() {
     }
 
     // Handle ACK signal and send MQTT message.
-    // Distinguish RX vs TX by tx_requests[ch].pending: TX sets it before we
-    // reach here; RX never touches it. That determines which ack_en flag
-    // gates the publish (rx_ack_en for RX, tx_ack_en for TX).
     for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
         if (mqtt_data[ch].pending) {
             bool is_tx = tx_requests[ch].pending;
             bool ack_gated = is_tx ? device_config.tx_ack_en : device_config.rx_ack_en;
             if (ack_active[ch] || !ack_gated) {
                 public_message(mqtt_data[ch]);
+                state_save_channel(ch);
                 tx_requests[ch].pending = false;
                 ack_active[ch] = false;
                 mqtt_data[ch].pending = false;
-                // Cancel the 2.2 s NACK timer and suppress any phantom
-                // timeout that fired in the same loop iteration as the
-                // ISR set ack_active. Prevents the "command failed"
-                // message from following a successful publish.
+                mqtt_data[ch].retries = 0;
                 if (ack_gated) {
                     ack_irq_stop(ch);
                     ack_timeout[ch] = false;
@@ -168,13 +156,9 @@ void loop() {
         }
     }
 
-    // Handle NACK signal
+    // Handle NACK signal & Retry mechanism with Delay
     for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
         if (ack_timeout[ch]) {
-            // Full diagnostic dump — gated on timing_diagnostics_en so it
-            // doesn't spam the log in normal operation. The "command failed"
-            // line below stays unconditional; HA/users should always see
-            // the actual failure message.
             if (device_config.debug_verbose && device_config.timing_diagnostics_en) {
                 uint32_t now_us     = micros();
                 uint32_t elapsed_us = now_us - ack_dbg_start_time[ch];
@@ -185,8 +169,6 @@ void loop() {
                     ? (int32_t)(ack_dbg_last_rise_time[ch] - ack_dbg_start_time[ch])
                     : 0;
 
-                // Dump the pulse history ring buffer (last N completed
-                // pulses, most recent last).
                 String history;
                 for (uint8_t i = 0; i < ACK_DBG_HISTORY; i++) {
                     uint8_t idx = (ack_dbg_pulse_history_pos[ch] + i) % ACK_DBG_HISTORY;
@@ -204,24 +186,41 @@ void loop() {
                     " isr_attached=" + String(ack_dbg_isr_attached[ch] ? 1 : 0) +
                     " history=[" + history + "]");
             }
-            public_debug_message("Ch " + String(ch) + " command failed");
 
-            mqtt_data[ch].pending = false;
-            tx_requests[ch].pending = false;
-            ack_timeout[ch] = false;
+            const uint8_t MAX_RETRIES = 3;
+            const unsigned long RETRY_DELAY_MS = 200;
+
+            if (mqtt_data[ch].retries < MAX_RETRIES) {
+                if (millis() - last_retry_time[ch] >= RETRY_DELAY_MS) {
+                    last_retry_time[ch] = millis();
+                    mqtt_data[ch].retries++;
+                    
+                    if (device_config.debug_verbose) {
+                        Serial.printf("Ch %d command failed, retrying (%d/%d)...\n", ch, mqtt_data[ch].retries, MAX_RETRIES);
+                    }
+
+                    send_tx_payload(ch, CHANNEL_GPIOS[ch], mqtt_data[ch].temp, mqtt_data[ch].state == "on", mqtt_data[ch].fan, ac_mode_from_string(mqtt_data[ch].mode));
+                    reconfig_rmt_rx_channel(ch, CHANNEL_GPIOS[ch]);
+
+                    if (device_config.tx_ack_en) {
+                        ack_irq_start(ch);
+                    }
+                    ack_timeout[ch] = false;
+                }
+            } else {
+                public_debug_message("Ch " + String(ch) + " command failed after " + String(MAX_RETRIES) + " retries");
+
+                mqtt_data[ch].pending = false;
+                tx_requests[ch].pending = false;
+                ack_timeout[ch] = false;
+                mqtt_data[ch].retries = 0;
+            }
         }
     }
 
     for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
         if (ack_width[ch] > 0) {
             if (device_config.debug_verbose && device_config.timing_diagnostics_en) {
-                // Successful ACK. Two cases:
-                //   Retrospective: the ISR captured the ACK's rising edge
-                //   BEFORE ack_irq_start() was called (typical for RX,
-                //   where parseRMTData took ~200 ms). detect_delta is
-                //   negative — the pulse ended before we armed.
-                //   Prospective: the ISR fired during the 2.2 s watch
-                //   window and set ack_active. detect_delta is positive.
                 int32_t detect_delta = 0;
                 bool retro = false;
                 if (ack_dbg_last_rise_time[ch] != 0) {
@@ -242,9 +241,6 @@ void loop() {
         }
     }
 
-    // Log per-loop-tick pulses > 100 ms so ordinary frame bits (~600 us)
-    // don't spam the pane. Anything close to the ACK's ~1.1 s or shorter
-    // near-ACK candidates still show up.
     for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
         if (ack_width_dbg[ch] > 0) {
             if (device_config.debug_verbose && device_config.timing_diagnostics_en && ack_width_dbg[ch] > 100000) {
@@ -254,7 +250,6 @@ void loop() {
         }
     }
     
-    // Send MQTT message when ESP has booted
     if (single_shot){
         public_debug_message("ESP boot done, version " + String(VERSION));
         single_shot = false;

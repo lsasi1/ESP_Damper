@@ -15,6 +15,7 @@ typedef struct {
     uint8_t fan;
     String mode;
     bool pending = false;
+    uint8_t retries = 0; // מונה נסיונות חוזרים (Retry)
 } mqtt_data_t;
 
 // Main INO buffers
@@ -24,6 +25,7 @@ extern mqtt_data_t mqtt_data[NUM_CHANNELS];
 void states_storage_init();
 void states_load_all();
 void state_save_channel(uint8_t ch);
+void states_handle_deferred_save(); // הוספה עבור מנגנון ה-Debounce ל-NVS
 
 // RX Global buffers and flags
 extern rmt_symbol_word_t rx_buffer[NUM_CHANNELS][RX_BUFFER_SIZE];
