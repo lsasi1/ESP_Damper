@@ -693,9 +693,9 @@ void web_begin(AsyncWebServer& server, PubSubClient& mqttClient) {
       return;
     }
 
-    raw_rmt_log_mark_ui_active_and_clear_if_needed();
+    web_log_mark_ui_active_and_clear_if_needed();
 
-    String out = raw_rmt_log_json();
+    String out = web_log_json();
 
     if (out.startsWith("{")) {
       out = "{\"enabled\":true,\"active\":true," + out.substring(1);
@@ -705,7 +705,7 @@ void web_begin(AsyncWebServer& server, PubSubClient& mqttClient) {
   });
 
   server.on("/rawlog/clear", HTTP_POST, [&](AsyncWebServerRequest *request) {
-    raw_rmt_log_clear();
+    web_log_clear();
     request->send(200, "text/plain", "OK");
   });
 

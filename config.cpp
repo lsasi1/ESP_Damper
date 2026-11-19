@@ -77,6 +77,7 @@ void config_save() {
 void config_clear() {
   prefs.clear();
   prefs.putBool("valid", false);
+  state_prefs.clear();
 }
 
 // ==========================================

@@ -28,6 +28,7 @@ void setup() {
 
     config_begin();
     config_load();
+    states_storage_init(); // <-- טעינת המצבים השמורים מ-NVS לתוך mqtt_data לפני הכול
     
     if(device_config.debug_verbose)
       Serial.println("Debug verbosity enabled");
@@ -57,10 +58,8 @@ void setup() {
 
     rx_set_callback(on_rx_frame); // Debug data callback
     
-    // שידור סטטוס ראשוני לכל הערוצים מיד עם סיום העלייה (Boot)
-    for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
-        public_message(mqtt_data[ch]);
-    }
+    // הערה: השידור הראשוני ל-MQTT מתבצע כעת אוטומטית בתוך reconnect() ב-wireless.cpp
+    // מיד לאחר שהחיבור ל-Broker נוצר והמצבים כבר טעונים ב-mqtt_data.
     led_set_on();
 }
 

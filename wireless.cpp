@@ -18,6 +18,7 @@ tx_request_t tx_requests[NUM_CHANNELS] = {};
 static void reconnect();
 static void mqtt_callback(char* topic, byte* payload, unsigned int length);
 static void publish_discovery();
+static void publish_all_states();
 
 extern const char* FW_VERSION_STR;
 
@@ -58,6 +59,12 @@ void wireless_loop() {
     ElegantOTA.loop();
 }
 
+static void publish_all_states() {
+  for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
+    public_message(mqtt_data[ch]);
+  }
+}
+
 static void reconnect() {
   int counter = 0;
   bool ok = false;
@@ -82,6 +89,7 @@ static void reconnect() {
       client.unsubscribe(device_config.mqtt_topic_rx);
       client.subscribe(device_config.mqtt_topic_rx);
       publish_discovery();
+      publish_all_states();
     } else {
       Serial.print(" Failed, rc=");
       Serial.println(client.state());
@@ -99,20 +107,20 @@ static void reconnect() {
 }
 
 static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-  StaticJsonDocument<100> jsonDoc;
+  StaticJsonDocument<160> jsonDoc;
   String jsonString;
+  jsonString.reserve(length + 1);
 
   for (unsigned int i = 0; i < length; i++) 
       jsonString += (char)tolower(payload[i]);
 
-  deserializeJson(jsonDoc, jsonString);
+  DeserializationError err = deserializeJson(jsonDoc, jsonString);
+  if (err) {
+    public_debug_message("MQTT JSON parse failed");
+    return;
+  }
   
-  uint8_t ch=0;
-  uint8_t temp=0;
-  String state="";
-  uint8_t fan=0;
-  AcMode mode = AC_MODE_UNKNOWN;
-
+  uint8_t ch = 0;
   if (jsonDoc.containsKey("ch")) {
     ch = jsonDoc["ch"].as<uint8_t>();
     if (ch >= NUM_CHANNELS) return;
@@ -120,23 +128,23 @@ static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 
   mqtt_data[ch].retries = 0;
 
-  if (jsonDoc.containsKey("temp")) {
-    temp = jsonDoc["temp"].as<uint8_t>();
-  } else {
-    temp = mqtt_data[ch].temp;
-  }
+  uint8_t temp = jsonDoc.containsKey("temp")
+                   ? jsonDoc["temp"].as<uint8_t>()
+                   : mqtt_data[ch].temp;
 
-  if (jsonDoc.containsKey("state")) {
-    state = jsonDoc["state"].as<String>();
-  }
-  if (jsonDoc.containsKey("fan")) {
-    fan = fan_label_to_damper_angle(jsonDoc["fan"].as<String>());
-  } else {
-    fan = mqtt_data[ch].fan;
-  }
+  String state = jsonDoc.containsKey("state")
+                   ? jsonDoc["state"].as<String>()
+                   : mqtt_data[ch].state;
 
+  uint8_t fan = jsonDoc.containsKey("fan")
+                  ? fan_label_to_damper_angle(jsonDoc["fan"].as<String>())
+                  : mqtt_data[ch].fan;
+
+  AcMode mode = AC_MODE_UNKNOWN;
   if (jsonDoc.containsKey("mode")) {
     mode = ac_mode_from_string(jsonDoc["mode"].as<String>());
+  } else {
+    mode = ac_mode_from_string(mqtt_data[ch].mode);
   }
 
   AcModel model = ac_model_from_string(device_config.ac_model);
@@ -170,7 +178,9 @@ void public_message(mqtt_data_t data) {
 
   serializeJson(doc, output);
   Serial.println(output);
-  client.publish(device_config.mqtt_topic_tx, output);
+
+  String ch_topic = String(device_config.mqtt_topic_tx) + "/ch" + String(data.ch);
+  client.publish(ch_topic.c_str(), output, true);
 }
 
 void public_debug_message(String msg) {
@@ -259,12 +269,15 @@ static void publish_discovery() {
   const AcModel model = ac_model_from_string(device_config.ac_model);
   const bool is_vat6 = (model == AC_MODEL_VAT6);
 
-  for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
-    const String unique_id   = base + "_ch" + ch;
-    const String object_id   = String("damper_ch") + ch;
-    const String config_topic = String("homeassistant/climate/") + unique_id + "/config";
+  DynamicJsonDocument doc(3072);
+  static char buffer[2560];
 
-    DynamicJsonDocument doc(3072);
+  for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
+    doc.clear();
+
+    const String unique_id    = base + "_ch" + ch;
+    const String object_id    = String("damper_ch") + ch;
+    const String config_topic = String("homeassistant/climate/") + unique_id + "/config";
 
     doc["name"]      = String("Damper Ch") + ch;
     doc["unique_id"] = unique_id;
@@ -297,36 +310,28 @@ static void publish_discovery() {
     doc["max_temp"]  = 30;
     doc["temp_step"] = 1;
 
-    const char* tx_topic = device_config.mqtt_topic_tx;
-    const char* rx_topic = device_config.mqtt_topic_rx;
+    const String ch_tx_topic = String(device_config.mqtt_topic_tx) + "/ch" + String(ch);
+    const char* rx_topic     = device_config.mqtt_topic_rx;
 
-    const String ch_filter = String("{% if value_json.ch == ") + ch + " %}";
+    doc["current_temperature_topic"]    = ch_tx_topic;
+    doc["current_temperature_template"] = "{{ value_json.temp }}";
 
-    doc["current_temperature_topic"]    = tx_topic;
-    doc["current_temperature_template"] =
-        ch_filter + "{{ value_json.temp }}{% endif %}";
+    doc["temperature_state_topic"]      = ch_tx_topic;
+    doc["temperature_state_template"]   = "{{ value_json.temp }}";
 
-    doc["temperature_state_topic"]      = tx_topic;
-    doc["temperature_state_template"]   =
-        ch_filter + "{{ value_json.temp }}{% endif %}";
-
-    doc["mode_state_topic"] = tx_topic;
+    doc["mode_state_topic"] = ch_tx_topic;
     if (is_vat6) {
       doc["mode_state_template"] =
-          ch_filter +
           "{% if value_json.state == 'off' %}off"
           "{% elif value_json.mode in ['cool','heat'] %}{{ value_json.mode }}"
-          "{% endif %}{% endif %}";
+          "{% endif %}";
     } else {
       doc["mode_state_template"] =
-          ch_filter +
-          "{% if value_json.state == 'off' %}off{% else %}auto{% endif %}"
-          "{% endif %}";
+          "{% if value_json.state == 'off' %}off{% else %}auto{% endif %}";
     }
 
-    doc["fan_mode_state_topic"]    = tx_topic;
-    doc["fan_mode_state_template"] =
-        ch_filter + "{{ value_json.fan }}{% endif %}";
+    doc["fan_mode_state_topic"]    = ch_tx_topic;
+    doc["fan_mode_state_template"] = "{{ value_json.fan }}";
 
     doc["temperature_command_topic"] = rx_topic;
     if (is_vat6) {
@@ -388,7 +393,6 @@ static void publish_discovery() {
           ",\"temp\":{{ this.attributes.temperature or 22 }}}";
     }
 
-    static char buffer[2560];
     size_t n = serializeJson(doc, buffer, sizeof(buffer));
 
     if (!client.publish(config_topic.c_str(), (const uint8_t*)buffer, n, true)) {
