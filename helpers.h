@@ -10,6 +10,12 @@ void clear_mqtt_data(mqtt_data_t mqtt_data);
 String binaryToHexGroups(const String &binStr);
 uint32_t binToDec(const String &binStr);
 bool validateAndParseFrames(std::vector<String> &frames, rx_data_t &rx_data, const char* model);
+String frame64ToBinaryString(uint64_t frameBits, uint8_t bitCount = 56);
+String frame64ToHexGroups(uint64_t frameBits, uint8_t byteCount = 7);
+bool validateAndParseFrames64(const uint64_t frames[RX_FRAMES],
+                              const uint8_t bitCounts[RX_FRAMES],
+                              rx_data_t &rx_data,
+                              const char* model);
 
 // Damper-angle <-> HA fan-mode label mapping.
 //   angle 0 -> "1"    (Low)

@@ -79,7 +79,9 @@ void loop() {
                 if (device_config.rx_ack_en) {
                     ack_irq_start(ch);
                     if (device_config.debug_verbose && device_config.timing_diagnostics_en) {
-                        uint32_t frame_to_start = ack_dbg_start_time[ch] - ack_dbg_frame_end_time[ch];
+                        uint32_t frame_to_start = ack_dbg_frame_end_time[ch]
+                            ? (ack_dbg_start_time[ch] - ack_dbg_frame_end_time[ch])
+                            : 0;
                         const char* how = ack_active[ch] ? "retrospective" : "prospective";
                         public_debug_message(String("Ch ") + ch + " RX ACK arm mode=" + how +
                                              " frame_to_start=" + String(frame_to_start) + "us"
@@ -257,13 +259,13 @@ void loop() {
 
 void on_rx_frame(uint8_t ch, const rmt_symbol_word_t* symbols, size_t num_symbols, const String& bits) {
   if (!device_config.debug_verbose) return;
-  StaticJsonDocument<2048> doc;
+  JsonDocument doc;
 
   doc["type"] = "raw_data";
   doc["ch"]   = ch;
   doc["hex"]  = binaryToHexGroups(bits);
 
-  JsonArray raw = doc.createNestedArray("raw");
+  JsonArray raw = doc["raw"].to<JsonArray>();
 
   for (size_t i = 0; i < num_symbols; i++) {
     raw.add(symbols[i].duration0);

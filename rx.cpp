@@ -2,6 +2,7 @@
 #include "helpers.h"
 #include "driver/gpio.h"
 #include "debug_log.h"
+#include "config.h"
 #include "serial_intercept.h"
 
 static rx_frame_cb_t rx_cb = nullptr;
@@ -61,7 +62,7 @@ rmt_receive_config_t rx_config = {
 void ack_irq_init(uint8_t ch) {
     esp_timer_create_args_t timer_args = {
         .callback = &oneshot_timer_callback,
-        .arg = (void*)ch,     // pass channel index here
+        .arg = (void*)(intptr_t)ch,
         .dispatch_method = ESP_TIMER_TASK,
     };
 
@@ -148,7 +149,7 @@ void ack_gpio_remove(uint8_t ch) {
     (void)ch;
 }
 
-void IRAM_ATTR oneshot_timer_callback(void *arg) {
+void oneshot_timer_callback(void *arg) {
     int ch = (int)(intptr_t)arg;
     ack_timeout[ch] = true;
     ack_width[ch]   = 0;
@@ -156,14 +157,14 @@ void IRAM_ATTR oneshot_timer_callback(void *arg) {
     // ISR stays attached — do NOT call ack_gpio_remove here.
 }
 
-void IRAM_ATTR ack_gpio_isr(void *arg) {
+void ack_gpio_isr(void *arg) {
     int ch = (int)(intptr_t)arg;
     bool state = digitalRead(CHANNEL_GPIOS[ch]);
     uint32_t now = micros();
 
     if (state) {
         // Rising edge — the low pulse just ended.
-        ack_dbg_rising_count[ch]++;
+        ack_dbg_rising_count[ch] = ack_dbg_rising_count[ch] + 1;
         ack_dbg_last_rise_time[ch] = now;
 
         // Compute width only if we have a captured falling-edge timestamp.
@@ -220,7 +221,7 @@ void IRAM_ATTR ack_gpio_isr(void *arg) {
         last_falling_us[ch] = now;
 
         // Diagnostics (per-window).
-        ack_dbg_falling_count[ch]++;
+        ack_dbg_falling_count[ch] = ack_dbg_falling_count[ch] + 1;
         if (ack_dbg_first_fall_time[ch] == 0) {
             ack_dbg_first_fall_time[ch] = now;
         }
@@ -302,21 +303,24 @@ void reconfig_rmt_rx_channel(uint8_t ch, gpio_num_t gpio) {
 bool parseRMTData(const char* model) {
     bool data_received = false;
 
-    // Check each channel for ready data
     for (uint8_t ch = 0; ch < NUM_CHANNELS; ++ch) {
         if (!data_ready[ch]) continue;
 
         size_t len = rx_data_len[ch];
         rmt_symbol_word_t symbols[RX_BUFFER_SIZE];
-        std::vector<String> frames;
-        for(int chunk=0; chunk<RX_FRAMES; chunk++) {
+        uint64_t frames[RX_FRAMES] = {0};
+        uint8_t bitCounts[RX_FRAMES] = {0};
+
+        for (int chunk = 0; chunk < RX_FRAMES; chunk++) {
             noInterrupts();
             memcpy(symbols, rx_data_copy[ch][chunk], len * sizeof(rmt_symbol_word_t));
             data_ready[ch] = false;
             interrupts();
 
             int i = 0;
-            String bits = "";
+            uint64_t accBits = 0;
+            uint8_t count = 0;
+
             int level0 = symbols[i].level1;
             int level1 = symbols[i].level0;
             int duration0 = symbols[i].duration1;
@@ -325,55 +329,56 @@ bool parseRMTData(const char* model) {
             if (level0 == 0 && duration0 >= HEADER_LOW_MIN && duration0 <= HEADER_LOW_MAX &&
                 level1 == 1 && duration1 >= HEADER_HIGH_MIN && duration1 <= HEADER_HIGH_MAX) {
                 i++;
-                bits = "";
-                Serial.printf("Ch %d chunk %d\n", ch, chunk);
+                if (device_config.debug_verbose) {
+                    Serial.printf("Ch %d chunk %d\n", ch, chunk);
+                }
                 while (i < (int)len) {
-                    level0 = symbols[i].level1;
-                    level1 = symbols[i].level0;
                     duration0 = symbols[i].duration1;
                     duration1 = symbols[i].duration0;
                     if (duration1 >= BIT_HIGH_0_MIN && duration1 <= BIT_HIGH_0_MAX) {
-                        bits += "0";
+                        accBits = (accBits << 1);
+                        count++;
                     } else if (duration1 >= BIT_HIGH_1_MIN && duration1 <= BIT_HIGH_1_MAX) {
-                        bits += "1";
+                        accBits = (accBits << 1) | 1ULL;
+                        count++;
                     } else {
-                        Serial.printf("Framing parsing error at location: %d\n", i);
-                        Serial.printf("Low: %d\n", duration0);
-                        Serial.printf("High: %d\n", duration1);
-                        i++;
-                        continue;
+                        if (device_config.debug_verbose) {
+                            Serial.printf("Framing parsing error at location: %d (Low: %d, High: %d)\n", i, duration0, duration1);
+                        }
                     }
                     i++;
                 }
             }
 
-            if (bits.length() > 0) {
-                frames.push_back(bits);
-            }
-            else {
-                frames.push_back(DUMMY_FRAME);
+            frames[chunk] = accBits;
+            bitCounts[chunk] = count;
+
+            if (count == 0 && device_config.debug_verbose) {
                 Serial.printf("Ch %d broken chunk diagnostics: level0=%d level1=%d dur0=%d dur1=%d\n", ch, level0, level1, duration0, duration1);
             }
-            
-            if(rx_cb) rx_cb(ch, symbols, len, bits); // Backup data for debug
+
+            // Only allocate String if debug verbose + callback are active
+            if (rx_cb && device_config.debug_verbose) {
+                String dbgBits = (count > 0) ? frame64ToBinaryString(accBits, count) : String(DUMMY_FRAME);
+                rx_cb(ch, symbols, len, dbgBits);
+            }
         }
 
-        if (frames.size() == RX_FRAMES) {
+        if (device_config.debug_verbose) {
             Serial.printf("Complete frame decoded (ch %u):\n", (unsigned)ch);
-            Serial.println("Frame 1: " + frames[0] + " (" + binaryToHexGroups(frames[0]) + ")");
-            Serial.println("Frame 2: " + frames[1] + " (" + binaryToHexGroups(frames[1]) + ")");
-            Serial.println("Frame 3: " + frames[2] + " (" + binaryToHexGroups(frames[2]) + ")");
-            bool res = validateAndParseFrames(frames, rx_data[ch], model);
-            if (res) {
-              rx_new_data[ch] = true;
-              data_received = true;
+            for (int f = 0; f < RX_FRAMES; f++) {
+                Serial.println("Frame " + String(f + 1) + ": " +
+                               frame64ToBinaryString(frames[f], bitCounts[f]) + " (" +
+                               frame64ToHexGroups(frames[f], 7) + ")");
             }
-            frames.clear();
-        } else {
-            Serial.printf("Invalid frames count found on ch %u!\n", (unsigned)ch);
-            frames.clear();
         }
+
+        if (validateAndParseFrames64(frames, bitCounts, rx_data[ch], model)) {
+            rx_new_data[ch] = true;
+            data_received = true;
+        }
+
         clear_rx_buffers(ch);
-    } // end channels loop
+    }
     return data_received;
 }

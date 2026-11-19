@@ -1,721 +1,340 @@
 #include "web.h"
 #include "config.h"
-#include "logo.h"
+#include "debug_log.h"
+#include "serial_intercept.h"
 #include <WiFi.h>
 #include <ArduinoJson.h>
-#include "debug_log.h"
-#include "ac_model.h"
-#include "serial_intercept.h"
 
-// SSE endpoint for live-streaming the debug log to browser clients.
-static AsyncEventSource log_events("/logstream");
+extern const char* FW_VERSION_STR;
 
-static void stream_log_line_to_sse(const String& line) {
-  // AsyncEventSource.send() is safe to call from any task; it queues
-  // per-client and returns immediately if no clients are connected.
-  log_events.send(line.c_str(), "log", millis());
-}
+static PubSubClient* mqtt_ref = nullptr;
+static unsigned long boot_ms = 0;
 
-// --------- Helpers ---------
-static String htmlEscape(const String& in) {
-  String out;
-  out.reserve(in.length() + 16);
-  for (size_t i = 0; i < in.length(); i++) {
-    char c = in[i];
-    switch (c) {
-      case '&': out += F("&amp;"); break;
-      case '<': out += F("&lt;"); break;
-      case '>': out += F("&gt;"); break;
-      case '"': out += F("&quot;"); break;
-      case '\'': out += F("&#39;"); break;
-      default: out += c; break;
-    }
+static const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP Damper Control</title>
+<style>
+  :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8; --accent: #38bdf8; --border: #334155; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 16px; }
+  .container { max-width: 720px; margin: 0 auto; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  h1 { margin: 0 0 4px; font-size: 1.4rem; }
+  h2 { margin: 0 0 14px; font-size: 1.1rem; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+  .sub { color: var(--muted); font-size: 0.85rem; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; }
+  input[type="text"], input[type="password"], input[type="number"], select {
+    width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: #0f172a; color: var(--text); font-size: 0.95rem;
   }
-  return out;
-}
+  .chk { display: flex; align-items: center; gap: 8px; margin: 8px 0; cursor: pointer; }
+  .chk input { width: 16px; height: 16px; }
+  .btn { background: var(--accent); color: #0f172a; border: none; padding: 10px 18px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 0.95rem; }
+  .btn:hover { opacity: 0.9; }
+  .btn-secondary { background: #334155; color: var(--text); text-decoration: none; display: inline-block; margin-left: 8px; }
+  .btn-sm { padding: 5px 12px; font-size: 0.8rem; }
+  .status-bar { display: flex; flex-wrap: wrap; gap: 10px; font-size: 0.85rem; color: var(--muted); }
+  .badge { background: #0f172a; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); }
+  .log-hdr { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 12px; }
+  .log-hdr h2 { border: none; padding: 0; margin: 0; }
+  #logBox { background: #090d16; color: #a5f3fc; font-family: ui-monospace, monospace; font-size: 0.8rem; height: 260px; overflow-y: auto; padding: 10px; border-radius: 8px; border: 1px solid var(--border); white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="card">
+    <h1>ESP Damper Controller</h1>
+    <div class="sub">Firmware: <span id="fwVer">...</span> | Free Heap: <span id="heapFree">...</span> KB</div>
+    <div class="status-bar">
+      <span class="badge">WiFi: <strong id="stWifi">...</strong></span>
+      <span class="badge">IP: <strong id="stIp">...</strong></span>
+      <span class="badge">MQTT: <strong id="stMqtt">...</strong></span>
+      <span class="badge">Uptime: <strong id="stUp">...</strong></span>
+    </div>
+  </div>
 
-static String valOrEmpty(const char* stored) {
-  if (stored && stored[0] != '\0') return htmlEscape(String(stored));
-  return String("");
-}
+  <form method="POST" action="/save">
+    <div class="card">
+      <h2>Device & AC Model</h2>
+      <div class="grid">
+        <div>
+          <label for="device_name">Device Name</label>
+          <input type="text" id="device_name" name="device_name" required>
+        </div>
+        <div>
+          <label for="ac_model">AC Protocol Model</label>
+          <select id="ac_model" name="ac_model">
+            <option value="tac910">TAC-910</option>
+            <option value="vat6">VAT-6</option>
+          </select>
+        </div>
+      </div>
+    </div>
 
-static String valPortOrEmpty(uint16_t port) {
-  if (port != 0) return String(port);
-  return String("");
-}
+    <div class="card">
+      <h2>WiFi Settings</h2>
+      <div class="grid">
+        <div>
+          <label for="wifi_ssid">WiFi SSID</label>
+          <input type="text" id="wifi_ssid" name="wifi_ssid">
+        </div>
+        <div>
+          <label for="wifi_pass">WiFi Password (leave blank to keep)</label>
+          <input type="password" id="wifi_pass" name="wifi_pass" placeholder="••••••••">
+        </div>
+      </div>
+    </div>
 
-static String wifiStatusStr() {
-  switch (WiFi.status()) {
-    case WL_CONNECTED: return "connected";
-    case WL_NO_SSID_AVAIL: return "no_ssid";
-    case WL_CONNECT_FAILED: return "failed";
-    case WL_DISCONNECTED: return "disconnected";
-    default: return "unknown";
+    <div class="card">
+      <h2>MQTT & Home Assistant</h2>
+      <div class="grid">
+        <div>
+          <label for="mqtt_server">Broker IP / Host</label>
+          <input type="text" id="mqtt_server" name="mqtt_server">
+        </div>
+        <div>
+          <label for="mqtt_port">Broker Port</label>
+          <input type="number" id="mqtt_port" name="mqtt_port" value="1883">
+        </div>
+        <div>
+          <label for="mqtt_user">MQTT Username</label>
+          <input type="text" id="mqtt_user" name="mqtt_user">
+        </div>
+        <div>
+          <label for="mqtt_pass">MQTT Password (leave blank to keep)</label>
+          <input type="password" id="mqtt_pass" name="mqtt_pass" placeholder="••••••••">
+        </div>
+        <div>
+          <label for="mqtt_topic_rx">Command Topic (RX)</label>
+          <input type="text" id="mqtt_topic_rx" name="mqtt_topic_rx">
+        </div>
+        <div>
+          <label for="mqtt_topic_tx">State Base Topic (TX)</label>
+          <input type="text" id="mqtt_topic_tx" name="mqtt_topic_tx">
+        </div>
+      </div>
+      <div style="margin-top:12px;">
+        <label class="chk"><input type="checkbox" id="enable_discovery" name="enable_discovery" value="1"> Enable Home Assistant MQTT Discovery</label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Diagnostics & Debug</h2>
+      <label class="chk"><input type="checkbox" id="debug_verbose" name="debug_verbose" value="1"> Verbose Serial / MQTT Frame Logging</label>
+      <label class="chk"><input type="checkbox" id="timing_diag" name="timing_diag" value="1"> RX/ACK Timing Diagnostics</label>
+      <div style="margin-top:14px;">
+        <button type="submit" class="btn">Save & Reboot</button>
+        <a href="/update" class="btn btn-secondary">Firmware OTA Update</a>
+        <button type="button" class="btn btn-secondary" onclick="fetch('/reboot',{method:'POST'}).then(()=>alert('Rebooting...'))">Reboot</button>
+      </div>
+    </div>
+  </form>
+
+  <div class="card">
+    <div class="log-hdr">
+      <h2>Live Serial Log</h2>
+      <button type="button" class="btn btn-secondary btn-sm" onclick="clearLogs()">Clear</button>
+    </div>
+    <div id="logBox">Loading logs...</div>
+  </div>
+</div>
+
+<script>
+function formatLogItem(item) {
+  if (typeof item === 'string') return item;
+  if (item && typeof item === 'object') {
+    const msg = item.msg ?? item.message ?? item.line ?? item.text ?? item.m ?? JSON.stringify(item);
+    const ts = item.ts ?? item.t ?? item.time;
+    return ts !== undefined ? `[${ts}] ${msg}` : String(msg);
   }
+  return String(item ?? '');
 }
 
-// --------- Page builder ---------
-static String buildConfigPageHtml() {
-  // Editable values
-  String val_dev  = valOrEmpty(device_config.device_name);
-  String val_ssid = valOrEmpty(device_config.wifi_ssid);
-  String val_mqtt = valOrEmpty(device_config.mqtt_server);
-  String val_port = valPortOrEmpty(device_config.mqtt_port);
-  String val_mqtt_user = valOrEmpty(device_config.mqtt_user);
-  String val_rx   = valOrEmpty(device_config.mqtt_topic_rx);
-  String val_tx   = valOrEmpty(device_config.mqtt_topic_tx);
-
-  // Password: never show stored value; leaving empty means unchanged
-  String wifi_pass_placeholder = (device_config.wifi_pass[0] != '\0')
-                                  ? String("********")
-                                  : String("WiFi password");
-
-  // MQTT password placeholder indicator (no reveal)
-  String mqtt_pass_placeholder = (device_config.mqtt_pass[0] != '\0')
-                                  ? String("********")
-                                  : String("MQTT password (optional)");
-
-  AcModel selectedModel = ac_model_from_string(device_config.ac_model);
-
-  String html;
-  html.reserve(9500);
-
-  html += F(
-    "<!DOCTYPE html><html><head>"
-    "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-    "<title>ESP Damper</title>"
-    "<link rel='icon' type='image/png' href='/logo.png?v=2'>"
-    "<link rel='apple-touch-icon' href='/logo.png?v=2'>"
-    "<style>"
-    ":root{--bg:#ffffff;--card:#f7f7f8;--border:#e5e5e7;--text:#1c1c1e;--muted:#8e8e93;--accent:#0a84ff;}"
-    "[data-theme='dark']{--bg:#0b0b0c;--card:#161618;--border:#2a2a2d;--text:#f2f2f7;--muted:#a1a1a6;--accent:#0a84ff;}"
-    "*{box-sizing:border-box;}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);}"
-    ".container{max-width:420px;margin:0 auto;padding:24px 16px 40px;}"
-    ".logo{display:block;max-width:350px;margin:8px auto 24px;}"
-    ".section{margin-bottom:16px;}"
-    ".field{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:12px 14px;margin-bottom:12px;}"
-    ".field label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;}"
-    ".field input{width:100%;border:none;outline:none;background:transparent;font-size:16px;color:var(--text);}"
-    ".button{width:100%;height:48px;border-radius:24px;border:none;font-size:16px;font-weight:600;cursor:pointer;}"
-    ".button.primary{background:var(--accent);color:white;margin-top:8px;}"
-    ".button.secondary{background:var(--card);color:var(--text);border:1px solid var(--border);margin-bottom:6px;}"
-    ".rawClearBtn{height:26px;border-radius:24px;border:none;font-size:14px;font-weight:400;cursor:pointer;background:var(--accent);color:white;padding:0 22px;min-width:76px;}"
-    ".status{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:14px;margin-bottom:16px;}"
-    ".chip{display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid var(--border);background:var(--bg);font-weight:600;font-size:13px;margin-right:8px;}"
-    ".chip.ok{background:#58a86c;color:#0b0b0c;border-color:#43734f;}"
-    ".chip.err{background:#d64a42;color:#ffffff;border-color:#963732;}"
-    "[data-theme='dark'] .chip.ok{color:#0b0b0c;}"
-    ".sub{margin-top:10px;color:var(--muted);font-size:12px;word-break:break-word;}"
-    ".switch{position:relative;display:inline-block;width:54px;height:32px;top:2px}"
-    ".switch input{display:none;}"
-    ".slider{position:absolute;cursor:pointer;inset:0;background:#797979;border-radius:999px;transition:.2s;}"
-    ".slider:before{content:'';position:absolute;height:26px;width:26px;left:3px;top:3px;background:white;border-radius:999px;transition:.2s;box-shadow:0 2px 10px rgba(0,0,0,.12);}"
-    ".switch input:checked + .slider{background:var(--accent);}"
-    ".switch input:checked + .slider:before{transform:translateX(22px);}"
-    "input[type='radio']{accent-color: var(--accent);width: 26px;height: 26px;}"
-    ".footer{margin-top: 24px;text-align: center;font-size: 12px;color: var(--muted);opacity: 0.8;}"
-    /* ---- Clear button inside password field ---- */
-    ".field.row{display:flex;align-items:center;gap:10px;}"
-    ".field.row .grow{flex:1;min-width:0;}"
-    ".clearBtn{border:none;background:transparent;color:var(--muted);font-size:14px;font-weight:600;cursor:pointer;"
-    "padding:10px 10px;border-radius:10px;}"
-    ".clearBtn:hover{background:rgba(142,142,147,.12);}"
-    "[data-theme='dark'] .clearBtn:hover{background:rgba(161,161,166,.14);}"
-    ".clearBtn:active{transform:scale(0.98);}"
-    ".field select{width:100%;border:none;outline:none;background:transparent;font-size:16px;color:var(--text);}"
-    "[data-theme='dark'] .field select option{background:#161618;color:#f2f2f7;}"
-    "</style></head><body><div class='container'>"
-  );
-
-  // Logo
-  html += F("<img class='logo' id='logoImg' src='/logo.png' alt='ESP Damper'>");
-
-  html += F("<form action='/save' method='POST' enctype='application/x-www-form-urlencoded'>");
-
-  // Config fields
-  html += F("<div class='section'>");
-
-  html += F("<div class='field'><label>Device Name</label><input name='devname' value='");
-  html += val_dev;
-  html += F("' placeholder='ESP-Damper'></div>");
-
-  html += F(
-    "<div class='section'>"
-    "<div class='field'>"
-    "<label>AC Controller Model</label>"
-    "<select name='ac_model' "
-    "style='width:100%;border:none;outline:none;background:transparent;"
-    "font-size:16px;color:var(--text);'>"
-  );
-
-  html += F("<option value='tac910' ");
-  html += selectedModel == AC_MODEL_TAC910 ? "selected" : "";
-  html += F(">Tadiran TAC-910</option>");
-
-  html += F("<option value='vat6' ");
-  html += selectedModel == AC_MODEL_VAT6 ? "selected" : "";
-  html += F(">Twitoplast Opal VAT-6</option>");
-  html += F("</select></div></div>");
-
-  html += F("<div class='field'><label>WiFi SSID</label><input name='ssid' value='");
-  html += val_ssid;
-  html += F("' placeholder='Network name'></div>");
-
-  html += F("<div class='field row'>");
-  html += F("<div class='grow'>");
-  html += F("<label>WiFi Password</label>");
-  html += F("<input id='wpass' name='pass' type='password' value='' placeholder='");
-  html += htmlEscape(wifi_pass_placeholder);
-  html += F("'>");
-  html += F("</div>");
-  html += F("<button type='button' class='clearBtn' id='clearWifiPass'>Clear</button>");
-  html += F("</div>");
-  html += F("<input type='hidden' id='clear_wpass' name='clear_wpass' value='0'>");
-
-  html += F("<div class='field'><label>MQTT Server</label><input name='mqtt' value='");
-  html += val_mqtt;
-  html += F("' placeholder='192.168.1.123'></div>");
-
-  html += F("<div class='field'><label>MQTT Port</label><input name='port' value='");
-  html += val_port;
-  html += F("' placeholder='1883'></div>");
-
-  html += F("<div class='field'><label>MQTT Username</label><input name='muser' value='");
-  html += val_mqtt_user;
-  html += F("' placeholder='MQTT Username (optional)'></div>");
-
-  html += F("<div class='field row'>");
-  html += F("<div class='grow'>");
-  html += F("<label>MQTT Password</label>");
-  html += F("<input id='mpass' name='mpass' type='password' value='' placeholder='");
-  html += htmlEscape(mqtt_pass_placeholder);
-  html += F("'>");
-  html += F("</div>");
-  html += F("<button type='button' class='clearBtn' id='clearMqttPass'>Clear</button>");
-  html += F("</div>");
-
-  html += F("<input type='hidden' id='clear_mpass' name='clear_mpass' value='0'>");
-
-  html += F("<div class='field'><label>MQTT RX Topic</label><input name='rx' value='");
-  html += val_rx;
-  html += F("' placeholder='/home/damper_cmd'></div>");
-
-  html += F("<div class='field'><label>MQTT TX Topic</label><input name='tx' value='");
-  html += val_tx;
-  html += F("' placeholder='/home/damper'></div>");
-
-  // Status panel
-  html += F(
-    "<div class='status'>"
-    "<div class='chip' id='wifiChip'>WiFi: ...</div>"
-    "<div class='chip' id='mqttChip'>MQTT: ...</div>"
-    "<div class='sub' id='infoLine1'>...</div>"
-    "<div class='sub' id='infoLine2'>...</div>"
-    "</div>"
-  );
-
-  // Appearance toggle
-  html += F(
-    "<div class='section'>"
-    "<div class='field' style='display:flex;align-items:center;justify-content:space-between;'>"
-    "<div style='font-size:16px;font-weight:400;'>Dark UI</div>"
-    "<label class='switch'><input id='darkToggle' type='checkbox'><span class='slider'></span></label>"
-    "</div></div>"
-  );
-
- // RX ACK/NACK enable
-  html += F(
-    "<div class='section'>"
-    "<div class='field' style='display:flex;align-items:center;justify-content:space-between;'>"
-    "<div style='font-size:16px;font-weight:400;'>RX ACK/NACK verification</div>"
-    "<label class='switch'>"
-    "<input type='checkbox' name='rx_ack_en' value='1' "
-  );
-  html += device_config.rx_ack_en ? "checked" : "";
-  html += F(
-    "><span class='slider'></span></label>"
-    "</div></div>"
-  );
-
-  // TX ACK/NACK enable
-  html += F(
-    "<div class='section'>"
-    "<div class='field' style='display:flex;align-items:center;justify-content:space-between;'>"
-    "<div style='font-size:16px;font-weight:400;'>TX ACK/NACK verification</div>"
-    "<label class='switch'>"
-    "<input type='checkbox' name='tx_ack_en' value='1' "
-  );
-  html += device_config.tx_ack_en ? "checked" : "";
-  html += F(
-    "><span class='slider'></span></label>"
-    "</div></div>"
-  );
-
-  // HA MQTT discovery
-  html += F(
-    "<div class='section'>"
-    "<div class='field' style='display:flex;align-items:center;justify-content:space-between;'>"
-    "<div style='font-size:16px;font-weight:400;'>HA MQTT auto-discovery</div>"
-    "<label class='switch'>"
-    "<input type='checkbox' name='discovery' value='1' "
-  );
-  html += device_config.enable_discovery ? "checked" : "";
-  html += F(
-    "><span class='slider'></span></label>"
-    "</div></div>"
-  );
-
-  // Debug verbosity
-  html += F(
-    "<div class='section'>"
-    "<div class='field' style='display:flex;align-items:center;justify-content:space-between;'>"
-    "<div style='font-size:16px;font-weight:400;'>Debug verbosity</div>"
-    "<label class='switch'>"
-    "<input type='checkbox' name='debug' value='1' "
-  );
-  html += device_config.debug_verbose ? "checked" : "";
-  html += F(
-    "><span class='slider'></span></label>"
-    "</div></div>"
-  );
-
-  // Timing diagnostics — verbose per-event ACK/RX/TX timing traces.
-  // Only takes effect when debug verbosity is also on.
-  html += F(
-    "<div class='section'>"
-    "<div class='field' style='display:flex;align-items:center;justify-content:space-between;'>"
-    "<div style='font-size:16px;font-weight:400;'>Timing diagnostics</div>"
-    "<label class='switch'>"
-    "<input type='checkbox' name='timing_diag' value='1' "
-  );
-  html += device_config.timing_diagnostics_en ? "checked" : "";
-  html += F(
-    "><span class='slider'></span></label>"
-    "</div></div>"
-  );
-
-  if (device_config.debug_verbose) {
-    html += F(
-      "<div class='section'>"
-      "<div class='field'>"
-
-      "<div style='display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;gap:6px;flex-wrap:wrap;'>"
-      "<div style='font-size:16px;font-weight:400;'>Debug Log</div>"
-      "<div style='display:flex;gap:6px;'>"
-      "<button type='button' id='rawPauseBtn' class='rawClearBtn'>Pause</button>"
-      "<button type='button' id='rawCopyBtn' class='rawClearBtn'>Copy</button>"
-      "<button type='button' class='rawClearBtn' onclick='clearRawLog()'>Clear</button>"
-      "</div>"
-      "</div>"
-
-      "<pre id='rawlog' "
-      "style='height:260px;overflow:auto;background:#111;color:#58a86c;padding:10px;border-radius:8px;font-size:12px;white-space:pre-wrap;margin:0;'>"
-      "Waiting for debug output..."
-      "</pre>"
-
-      "</div>"
-      "</div>"
-    );
-  }
-
-  html += F("<button class='button primary' type='submit'>Save & Reboot</button>");
-
-  html += F("</div>"); // section
-  html += F("</form>");
-
-  html += F("<button class='button secondary' onclick=\"location.href='/update'\">Update Firmware</button>");
-
-  html += F(
-    "<button class='button secondary' style='margin-top:12px;border-color:#963732;color:#fff;background:#d64a42;' "
-    "onclick=\"if(confirm('Factory reset, really? This will erase WiFi/MQTT settings and reboot.')) location.href='/reset';\">"
-    "Factory Reset</button>"
-  );
-
-  // JS: theme + status polling + clear password (NEW)
-  html += F(
-    "<script>"
-    "function applyTheme(d){document.documentElement.setAttribute('data-theme', d?'dark':'light');}"
-    "let dark=(localStorage.getItem('ui_dark')==='1');"
-    "applyTheme(dark);"
-    "const t=document.getElementById('darkToggle');"
-    "t.checked=dark;"
-    "t.addEventListener('change',()=>{"
-    "const v=t.checked?'1':'0';"
-    "localStorage.setItem('ui_dark',v);"
-    "applyTheme(t.checked);"
-    "fetch('/theme?dark='+v);"
-    "});"
-
-    "const clearWifiBtn = document.getElementById('clearWifiPass');"
-    "const clearWifiFlag = document.getElementById('clear_wpass');"
-    "const wifiPassInput = document.getElementById('wpass');"
-
-    // ---- Clear WIFI password button ----
-    "if(clearWifiBtn && clearWifiFlag && wifiPassInput) {"
-    "  clearWifiBtn.addEventListener('click', () => {"
-    "    clearWifiFlag.value = '1';"
-    "    wifiPassInput.value = '';"
-    "    wifiPassInput.placeholder = 'WiFi password';"
-    "  });"
-    "}"
-
-    // ---- Clear MQTT password button ----
-    "const clearBtn=document.getElementById('clearMqttPass');"
-    "const clearFlag=document.getElementById('clear_mpass');"
-    "const passInput=document.getElementById('mpass');"
-    "if(clearBtn&&clearFlag&&passInput){"
-    "  clearBtn.addEventListener('click',()=>{"
-    "    clearFlag.value='1';"
-    "    passInput.value='';"
-    "    passInput.placeholder='MQTT password';"
-    "  });"
-    "}"
-
-    "async function refreshStatus(){"
-    "try{const r=await fetch('/status',{cache:'no-store'});const s=await r.json();"
-    "const wifiOk=(s.wifi==='connected')||(s.mode==='ap');"
-    "const mqttOk=!!s.mqtt_connected;"
-    "const wifiChip=document.getElementById('wifiChip');"
-    "const mqttChip=document.getElementById('mqttChip');"
-    "wifiChip.textContent=`WiFi: ${wifiOk?'OK':'ERR'} (${s.mode.toUpperCase()})`;"
-    "wifiChip.classList.toggle('ok',wifiOk);"
-    "wifiChip.classList.toggle('err',!wifiOk);"
-    "mqttChip.textContent=`MQTT: ${mqttOk?'OK':'ERR'}`;"
-    "mqttChip.classList.toggle('ok',mqttOk);"
-    "mqttChip.classList.toggle('err',!mqttOk);"
-    "document.getElementById('infoLine1').textContent=`WiFi SSID: ${s.ssid} | IP: ${s.ip} | RSSI: ${s.rssi} dBm`;"
-    "document.getElementById('infoLine2').textContent=`MQTT: ${s.mqtt_server}:${s.mqtt_port} | State: ${s.mqtt_state} | Auth: ${s.mqtt_auth ? 'ON' : 'OFF'}`;"
-    "}catch(e){"
-    "const wifiChip=document.getElementById('wifiChip');"
-    "const mqttChip=document.getElementById('mqttChip');"
-    "wifiChip.textContent='WiFi: ERR';"
-    "mqttChip.textContent='MQTT: ERR';"
-    "wifiChip.classList.add('err');wifiChip.classList.remove('ok');"
-    "mqttChip.classList.add('err');mqttChip.classList.remove('ok');"
-    "document.getElementById('infoLine1').textContent='Status unavailable';"
-    "}}"
-    "refreshStatus();setInterval(refreshStatus,1000);"
-    
-   "let rawLastSeq = 0;"
-    "let rawLastText = '';"
-    "let rawPaused = false;"
-
-    "const rawPauseBtn = document.getElementById('rawPauseBtn');"
-    "if (rawPauseBtn) {"
-    "  rawPauseBtn.addEventListener('click', () => {"
-    "    rawPaused = !rawPaused;"
-    "    rawPauseBtn.textContent = rawPaused ? 'Resume' : 'Pause';"
-    "    rawPauseBtn.style.background = rawPaused ? '#d64a42' : '';"
-    "  });"
-    "}"
-
-    "const rawCopyBtn = document.getElementById('rawCopyBtn');"
-    "if (rawCopyBtn) {"
-    "  rawCopyBtn.addEventListener('click', async () => {"
-    "    const el = document.getElementById('rawlog');"
-    "    if (!el) return;"
-    "    const text = el.textContent || '';"
-    "    const orig = rawCopyBtn.textContent;"
-    "    let ok = false;"
-    "    if (navigator.clipboard && window.isSecureContext) {"
-    "      try { await navigator.clipboard.writeText(text); ok = true; } catch (e) {}"
-    "    }"
-    "    if (!ok) {"
-    "      const ta = document.createElement('textarea');"
-    "      ta.value = text;"
-    "      ta.style.position = 'fixed'; ta.style.left = '-9999px'; ta.style.top = '0';"
-    "      document.body.appendChild(ta);"
-    "      ta.focus(); ta.select();"
-    "      try { ok = document.execCommand('copy'); } catch (e) {}"
-    "      document.body.removeChild(ta);"
-    "    }"
-    "    rawCopyBtn.textContent = ok ? 'Copied!' : 'Copy failed';"
-    "    setTimeout(() => rawCopyBtn.textContent = orig, 1200);"
-    "  });"
-    "}"
-
-    "function rawSelectionInside(el) {"
-    "  const s = window.getSelection();"
-    "  if (!s || s.rangeCount === 0 || s.isCollapsed) return false;"
-    "  return el.contains(s.getRangeAt(0).commonAncestorContainer);"
-    "}"
-
-    // Always fetch so the server keeps the UI marked active — see
-    // web_log_mark_ui_active_and_clear_if_needed() in debug_log.cpp.
-    // Only the DOM update is gated on Pause / selection / unchanged text.
-    "async function pollRawLog() {"
-    "  const el = document.getElementById('rawlog');"
-    "  if (!el) return;"
-    "  let j;"
-    "  try {"
-    "    const r = await fetch('/rawlog', {cache:'no-store'});"
-    "    j = await r.json();"
-    "  } catch (e) {"
-    "    if (!rawPaused && !rawSelectionInside(el)) {"
-    "      el.textContent = 'Debug log fetch failed: ' + e;"
-    "    }"
-    "    return;"
-    "  }"
-    "  if (j.enabled === false) return;"
-    "  if (!j.lines) return;"
-    "  let text = '';"
-    "  let maxSeq = rawLastSeq;"
-    "  for (const item of j.lines) {"
-    "    text += item.text + '\\n';"
-    "    if (item.seq > maxSeq) maxSeq = item.seq;"
-    "  }"
-    "  text = text || 'No debug output yet.';"
-    "  rawLastSeq = maxSeq;"
-    "  if (rawPaused) return;"
-    "  if (rawSelectionInside(el)) return;"
-    "  if (text === rawLastText) return;"
-    "  const atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 30;"
-    "  el.textContent = text;"
-    "  rawLastText = text;"
-    "  if (atBottom) el.scrollTop = el.scrollHeight;"
-    "}"
-    "async function clearRawLog() {"
-    "  await fetch('/rawlog/clear', { method: 'POST' });"
-    "  rawLastSeq = 0;"
-    "  rawLastText = '';"
-    "  const el = document.getElementById('rawlog');"
-    "  if (el) el.textContent = 'No debug output yet.';"
-    "}"
-    // Initial history load via /rawlog, then live updates via SSE.
-    // No periodic polling needed — the debug log stream pushes every new
-    // line via server-sent events.
-    "pollRawLog();"
-    "if (typeof EventSource !== 'undefined') {"
-    "  const es = new EventSource('/logstream');"
-    "  es.addEventListener('log', (e) => {"
-    "    const el = document.getElementById('rawlog');"
-    "    if (!el) return;"
-    "    if (rawPaused) return;"
-    "    if (rawSelectionInside(el)) return;"
-    "    let current = el.textContent;"
-    "    if (current === 'Waiting for debug output...' || current === 'No debug output yet.') {"
-    "      current = '';"
-    "    }"
-    "    const atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 30;"
-    "    let newText = current + e.data + '\\n';"
-    "    if (newText.length > 5000000) newText = newText.slice(-4000000);"
-    "    el.textContent = newText;"
-    "    rawLastText = newText;"
-    "    if (atBottom) el.scrollTop = el.scrollHeight;"
-    "  });"
-    "}"
-    "</script>"
-  );
-
-  html += F("<div class='footer'>FW version: ");
-  html += FW_VERSION_STR;
-  html += F("</div>");
-
-  html += F("</div></body></html>");
-
-  return html;
+async function loadConfig() {
+  try {
+    const r = await fetch('/config');
+    const c = await r.json();
+    document.getElementById('fwVer').textContent = c.fw_version || '';
+    document.getElementById('device_name').value = c.device_name || '';
+    document.getElementById('ac_model').value = c.ac_model || 'tac910';
+    document.getElementById('wifi_ssid').value = c.wifi_ssid || '';
+    document.getElementById('mqtt_server').value = c.mqtt_server || '';
+    document.getElementById('mqtt_port').value = c.mqtt_port || 1883;
+    document.getElementById('mqtt_user').value = c.mqtt_user || '';
+    document.getElementById('mqtt_topic_rx').value = c.mqtt_topic_rx || '';
+    document.getElementById('mqtt_topic_tx').value = c.mqtt_topic_tx || '';
+    document.getElementById('enable_discovery').checked = !!c.enable_discovery;
+    document.getElementById('debug_verbose').checked = !!c.debug_verbose;
+    document.getElementById('timing_diag').checked = !!c.timing_diag;
+  } catch (e) { console.error(e); }
 }
 
-// --------- Route registrations ---------
-void web_begin(AsyncWebServer& server, PubSubClient& mqttClient) {
+async function pollStatus() {
+  try {
+    const r = await fetch('/status');
+    const s = await r.json();
+    document.getElementById('stWifi').textContent = s.wifi || '-';
+    document.getElementById('stIp').textContent = s.ip || '-';
+    document.getElementById('stMqtt').textContent = s.mqtt || '-';
+    document.getElementById('stUp').textContent = (s.uptime || 0) + 's';
+    if (s.heap_kb !== undefined) document.getElementById('heapFree').textContent = s.heap_kb;
+  } catch (e) {}
+}
 
-  // SSE: live debug-log stream. Client opens EventSource('/logstream'),
-  // server pushes one 'log' event per stored line via stream_log_line_to_sse.
-  server.addHandler(&log_events);
-  web_log_set_stream_callback(&stream_log_line_to_sse);
+async function pollLogs() {
+  try {
+    const r = await fetch('/logs');
+    const data = await r.json();
+    const box = document.getElementById('logBox');
+    const atBottom = box.scrollHeight - box.scrollTop <= box.clientHeight + 30;
+    const rawLines = Array.isArray(data) ? data : (data.lines || data.logs || []);
+    box.textContent = rawLines.map(formatLogItem).join('\n');
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  } catch (e) {}
+}
 
-  server.on("/logo.png", HTTP_GET, [](AsyncWebServerRequest *request) {
-    AsyncWebServerResponse *response = request->beginResponse_P(200, "image/png", (const uint8_t*)LOGO_PNG, LOGO_PNG_LEN);
-    response->setContentLength(LOGO_PNG_LEN);
-    response->addHeader("Content-Encoding", "identity");
-    response->addHeader("Cache-Control", "no-store");
-    request->send(response);
+async function clearLogs() {
+  try {
+    await fetch('/logs/clear', { method: 'POST' });
+    document.getElementById('logBox').textContent = '';
+  } catch (e) {}
+}
+
+loadConfig();
+pollStatus();
+pollLogs();
+setInterval(pollStatus, 3000);
+setInterval(pollLogs, 2000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+void web_begin(AsyncWebServer &server, PubSubClient &mqttClient) {
+  mqtt_ref = &mqttClient;
+  boot_ms = millis();
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    web_log_mark_ui_active_and_clear_if_needed();
+    request->send(200, "text/html", INDEX_HTML);
   });
 
-  server.on("/", HTTP_GET, [&](AsyncWebServerRequest *request) {
-    request->send(200, "text/html", buildConfigPageHtml());
-  });
-
-  server.on("/reset", HTTP_GET, [&](AsyncWebServerRequest *request) {
-    request->send(200, "text/plain", "Factory reset... rebooting");
-    Serial.println("Factory reset: clearing config and rebooting...");
-    config_clear();
-    delay(150);
-    ESP.restart();
-  });
-
-  // Save
-  server.on("/save", HTTP_POST, [&](AsyncWebServerRequest *request) {
-    auto update_str_if_changed = [&](const char* name, char* target, size_t len) {
-      if (!request->hasParam(name, true)) return;
-      String v = request->getParam(name, true)->value();
-      if (v == String(target)) return;
-      strlcpy(target, v.c_str(), len);
-      Serial.print("Updated param: "); Serial.print(name); Serial.print(" to "); Serial.println(v);
-    };
-
-    update_str_if_changed("devname", device_config.device_name, sizeof(device_config.device_name));
-    update_str_if_changed("mqtt",    device_config.mqtt_server, sizeof(device_config.mqtt_server));
-    update_str_if_changed("rx",      device_config.mqtt_topic_rx, sizeof(device_config.mqtt_topic_rx));
-    update_str_if_changed("tx",      device_config.mqtt_topic_tx, sizeof(device_config.mqtt_topic_tx));
-    update_str_if_changed("ssid",    device_config.wifi_ssid, sizeof(device_config.wifi_ssid));
-    update_str_if_changed("muser",   device_config.mqtt_user, sizeof(device_config.mqtt_user));
-   
-    device_config.debug_verbose = request->hasParam("debug", true);
-    device_config.rx_ack_en = request->hasParam("rx_ack_en", true);
-    device_config.tx_ack_en = request->hasParam("tx_ack_en", true);
-    device_config.enable_discovery = request->hasParam("discovery", true);
-    device_config.timing_diagnostics_en = request->hasParam("timing_diag", true);
-
-    if (device_config.wifi_ssid[0] == '\0') device_config.wifi_pass[0] = '\0';
-    if (device_config.mqtt_user[0] == '\0') device_config.mqtt_pass[0] = '\0';
-
-    if (request->hasParam("ac_model", true)) {
-      String v = request->getParam("ac_model", true)->value();
-      v.trim();
-      v.toLowerCase();
-
-      if (v == "vat6" || v == "tac910") {
-        strlcpy(device_config.ac_model, v.c_str(), sizeof(device_config.ac_model));
-      } else {
-        strlcpy(device_config.ac_model, "tac910", sizeof(device_config.ac_model));
-      }
-    }
-
-    // Clear WiFi password if Clear was pressed
-    if (request->hasParam("clear_wpass", true)) {
-      String f = request->getParam("clear_wpass", true)->value();
-      if (f == "1") {
-        device_config.wifi_pass[0] = '\0';
-      }
-    }
-
-    // WiFi Password: only overwrite if user entered something
-    if (request->hasParam("pass", true)) {
-      String v = request->getParam("pass", true)->value();
-      if (v.length() > 0) {
-        strlcpy(device_config.wifi_pass, v.c_str(), sizeof(device_config.wifi_pass));
-      }
-    }
-
-    // MQTT password if Clear was pressed
-    if (request->hasParam("clear_mpass", true)) {
-      String f = request->getParam("clear_mpass", true)->value();
-      if (f == "1") {
-        device_config.mqtt_pass[0] = '\0';
-        Serial.println("Cleared MQTT password");
-      }
-    }
-
-    if (request->hasParam("mpass", true)) {
-      String v = request->getParam("mpass", true)->value();
-      if (v.length() > 0) {
-        strlcpy(device_config.mqtt_pass, v.c_str(), sizeof(device_config.mqtt_pass));
-        Serial.println("Updated MQTT password");
-      }
-    }
-
-    // Port: update if changed and non-zero
-    if (request->hasParam("port", true)) {
-      String p = request->getParam("port", true)->value();
-      uint16_t newPort = (uint16_t)p.toInt();
-      if (newPort != 0 && newPort != device_config.mqtt_port) {
-        device_config.mqtt_port = newPort;
-      }
-    }
-
-    config_save();
-
-    request->send(200, "text/html",
-      "<!doctype html><html><head>"
-      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-      "<title>Rebooting...</title>"
-      "<style>"
-      "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
-      "text-align:center;padding:40px;background:#fff;color:#111;}"
-      "</style>"
-      "</head><body>"
-      "<h2 style='color:#0a84ff;font-size:32px;'>Saved!</h2>"
-      "<p>Rebooting device...</p>"
-      "<p id='st'>Please wait...</p>"
-      "<script>"
-      "function ping(){"
-      " fetch('/',{cache:'no-store'})"
-      "  .then(()=>location.href='/')"
-      "  .catch(()=>setTimeout(ping,1000));"
-      "}"
-      "setTimeout(ping,1500);"
-      "</script>"
-      "</body></html>"
-    );
-
-    // Schedule reboot after response had time to flush
-    static esp_timer_handle_t reboot_timer = nullptr;
-
-    if (!reboot_timer) {
-      esp_timer_create_args_t args = {};
-      args.callback = [](void*) { ESP.restart(); };
-      args.arg = nullptr;
-      args.dispatch_method = ESP_TIMER_TASK;
-      args.name = "reboot_timer";
-      esp_timer_create(&args, &reboot_timer);
-    }
-
-    // 1500ms gives the browser time to receive/render the HTML reliably
-    esp_timer_stop(reboot_timer);
-    esp_timer_start_once(reboot_timer, 1500 * 1000);  // microseconds
-  });
-
-  // Status JSON
-  server.on("/status", HTTP_GET, [&](AsyncWebServerRequest *request) {
-    StaticJsonDocument<384> doc;
-
-    doc["mode"] = (WiFi.getMode() == WIFI_AP) ? "ap" : "sta";
-    doc["wifi"] = wifiStatusStr();
-    doc["ssid"] = (WiFi.getMode() == WIFI_AP) ? String("ESP-Damper-Setup") : String(WiFi.SSID());
-    doc["ip"]   = (WiFi.getMode() == WIFI_AP) ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
-    doc["rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
-
-    doc["mqtt_connected"] = mqttClient.connected();
-    doc["mqtt_state"]     = mqttClient.state();
-    doc["mqtt_server"]    = String(device_config.mqtt_server);
-    doc["mqtt_port"]      = device_config.mqtt_port;
-    doc["mqtt_auth"]      = (device_config.mqtt_user[0] != '\0');
+  server.on("/config", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    doc["fw_version"]       = FW_VERSION_STR;
+    doc["device_name"]      = device_config.device_name;
+    doc["ac_model"]         = device_config.ac_model;
+    doc["wifi_ssid"]        = device_config.wifi_ssid;
+    doc["mqtt_server"]      = device_config.mqtt_server;
+    doc["mqtt_port"]        = device_config.mqtt_port;
+    doc["mqtt_user"]        = device_config.mqtt_user;
+    doc["mqtt_topic_rx"]    = device_config.mqtt_topic_rx;
+    doc["mqtt_topic_tx"]    = device_config.mqtt_topic_tx;
+    doc["enable_discovery"] = device_config.enable_discovery;
+    doc["debug_verbose"]    = device_config.debug_verbose;
+    doc["timing_diag"]      = device_config.timing_diagnostics_en;
 
     String out;
     serializeJson(doc, out);
     request->send(200, "application/json", out);
   });
 
-  server.on("/rawlog", HTTP_GET, [&](AsyncWebServerRequest *request) {
-    if (!device_config.debug_verbose) {
-      request->send(200, "application/json", "{\"enabled\":false,\"active\":false,\"lines\":[]}");
-      return;
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    if (WiFi.getMode() == WIFI_AP) {
+      doc["wifi"] = "AP Mode";
+      doc["ip"]   = WiFi.softAPIP().toString();
+    } else if (WiFi.status() == WL_CONNECTED) {
+      doc["wifi"] = "Connected (" + String(WiFi.RSSI()) + " dBm)";
+      doc["ip"]   = WiFi.localIP().toString();
+    } else {
+      doc["wifi"] = "Disconnected";
+      doc["ip"]   = "0.0.0.0";
     }
 
-    web_log_mark_ui_active_and_clear_if_needed();
+    doc["mqtt"]    = (mqtt_ref && mqtt_ref->connected()) ? "Connected" : "Disconnected";
+    doc["uptime"]  = (millis() - boot_ms) / 1000;
+    doc["heap_kb"] = ESP.getFreeHeap() / 1024;
 
-    String out = web_log_json();
-
-    if (out.startsWith("{")) {
-      out = "{\"enabled\":true,\"active\":true," + out.substring(1);
-    }
-
+    String out;
+    serializeJson(doc, out);
     request->send(200, "application/json", out);
   });
 
-  server.on("/rawlog/clear", HTTP_POST, [&](AsyncWebServerRequest *request) {
+  server.on("/logs", HTTP_GET, [](AsyncWebServerRequest *request) {
+    web_log_mark_ui_active_and_clear_if_needed();
+    request->send(200, "application/json", web_log_json());
+  });
+
+  server.on("/logs/clear", HTTP_POST, [](AsyncWebServerRequest *request) {
     web_log_clear();
     request->send(200, "text/plain", "OK");
   });
 
-  // Theme: persist on device
-  server.on("/theme", HTTP_GET, [&](AsyncWebServerRequest *request) {
-    if (request->hasParam("dark")) {
-      String v = request->getParam("dark")->value();
-      device_config.dark_mode = (v == "1");
-      config_save();
+  server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("device_name", true)) {
+      strlcpy(device_config.device_name, request->getParam("device_name", true)->value().c_str(), sizeof(device_config.device_name));
     }
-    request->redirect("/");
+    if (request->hasParam("ac_model", true)) {
+      strlcpy(device_config.ac_model, request->getParam("ac_model", true)->value().c_str(), sizeof(device_config.ac_model));
+    }
+    if (request->hasParam("wifi_ssid", true)) {
+      strlcpy(device_config.wifi_ssid, request->getParam("wifi_ssid", true)->value().c_str(), sizeof(device_config.wifi_ssid));
+    }
+    if (request->hasParam("wifi_pass", true)) {
+      String p = request->getParam("wifi_pass", true)->value();
+      if (p.length() > 0) {
+        strlcpy(device_config.wifi_pass, p.c_str(), sizeof(device_config.wifi_pass));
+      }
+    }
+    if (request->hasParam("mqtt_server", true)) {
+      strlcpy(device_config.mqtt_server, request->getParam("mqtt_server", true)->value().c_str(), sizeof(device_config.mqtt_server));
+    }
+    if (request->hasParam("mqtt_port", true)) {
+      int port = request->getParam("mqtt_port", true)->value().toInt();
+      if (port > 0 && port <= 65535) device_config.mqtt_port = (uint16_t)port;
+    }
+    if (request->hasParam("mqtt_user", true)) {
+      strlcpy(device_config.mqtt_user, request->getParam("mqtt_user", true)->value().c_str(), sizeof(device_config.mqtt_user));
+    }
+    if (request->hasParam("mqtt_pass", true)) {
+      String p = request->getParam("mqtt_pass", true)->value();
+      if (p.length() > 0) {
+        strlcpy(device_config.mqtt_pass, p.c_str(), sizeof(device_config.mqtt_pass));
+      }
+    }
+    if (request->hasParam("mqtt_topic_rx", true)) {
+      strlcpy(device_config.mqtt_topic_rx, request->getParam("mqtt_topic_rx", true)->value().c_str(), sizeof(device_config.mqtt_topic_rx));
+    }
+    if (request->hasParam("mqtt_topic_tx", true)) {
+      strlcpy(device_config.mqtt_topic_tx, request->getParam("mqtt_topic_tx", true)->value().c_str(), sizeof(device_config.mqtt_topic_tx));
+    }
+
+    device_config.enable_discovery      = request->hasParam("enable_discovery", true);
+    device_config.debug_verbose         = request->hasParam("debug_verbose", true);
+    device_config.timing_diagnostics_en = request->hasParam("timing_diag", true);
+
+    config_save();
+
+    request->send(200, "text/html",
+      "<html><body style='background:#0f172a;color:#f8fafc;font-family:sans-serif;padding:24px;'>"
+      "<h2>Settings Saved! Rebooting...</h2>"
+      "<script>setTimeout(()=>location.href='/', 4000);</script>"
+      "</body></html>");
+
+    delay(500);
+    ESP.restart();
+  });
+
+  server.on("/reboot", HTTP_POST, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", "Rebooting");
+    delay(300);
+    ESP.restart();
   });
 }

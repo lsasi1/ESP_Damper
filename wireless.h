@@ -31,6 +31,6 @@ void wireless_setup();
 void wireless_loop();
 void public_message(mqtt_data_t data);
 void public_debug_message(String msg);
-void public_raw_message(StaticJsonDocument<2048> doc);
+void public_raw_message(JsonDocument& doc);
 void start_ap_mode();
 void start_sta_mode();

@@ -132,5 +132,4 @@ void send_tx_payload(uint8_t ch, gpio_num_t gpio, uint8_t temperature, bool stat
     ESP_ERROR_CHECK(rmt_tx_wait_all_done(tx_channel[ch], 1000));
 
     Serial.printf("Sent one frame on ch %u\n", (unsigned)ch);
-    delay(100);
 }
